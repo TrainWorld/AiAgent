@@ -109,6 +109,9 @@ internal class InferenceEngineImpl private constructor(
     @FastNative
     private external fun shutdown()
 
+    @FastNative
+    private external fun setInferenceParams(temperature: Float, contextSize: Int, nThreads: Int)
+
     private val _state =
         MutableStateFlow<InferenceEngine.State>(InferenceEngine.State.Uninitialized)
     override val state: StateFlow<InferenceEngine.State> = _state.asStateFlow()
@@ -340,5 +343,9 @@ internal class InferenceEngineImpl private constructor(
             }
         }
         llamaScope.cancel()
+    }
+
+    override fun setParams(temperature: Float, contextSize: Int, nThreads: Int) {
+        setInferenceParams(temperature, contextSize, nThreads)
     }
 }

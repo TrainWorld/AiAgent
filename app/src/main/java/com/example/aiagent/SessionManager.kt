@@ -32,24 +32,31 @@ class SessionManager(context: Context) {
         appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val mutex = Mutex()
 
+    /** 内存缓存：避免每次操作都从磁盘读取会话索引 */
+    @Volatile
+    private var cachedSessions: List<Session>? = null
+
     // ──────────────────── 会话索引 ────────────────────
 
-    /** 加载全部会话（按更新时间倒序） */
-    suspend fun loadSessions(): List<Session> = withContext(Dispatchers.IO) {
-        if (!indexFile.exists()) return@withContext emptyList()
-        try {
-            val json = indexFile.readText()
-            val array = JSONArray(json)
-            List(array.length()) { i ->
-                parseSessionFromJson(array.getJSONObject(i))
-            }.sortedByDescending { it.updatedAt }
-        } catch (e: Exception) {
-            Log.e(TAG, "加载会话列表失败", e)
-            emptyList()
+    /** 加载全部会话（按更新时间倒序），优先使用内存缓存 */
+    suspend fun loadSessions(): List<Session> {
+        cachedSessions?.let { return it }
+        return withContext(Dispatchers.IO) {
+            if (!indexFile.exists()) return@withContext emptyList<Session>().also { cachedSessions = it }
+            try {
+                val json = indexFile.readText()
+                val array = JSONArray(json)
+                List(array.length()) { i ->
+                    parseSessionFromJson(array.getJSONObject(i))
+                }.sortedByDescending { it.updatedAt }.also { cachedSessions = it }
+            } catch (e: Exception) {
+                Log.e(TAG, "加载会话列表失败", e)
+                emptyList()
+            }
         }
     }
 
-    /** 保存会话索引 */
+    /** 更新内存缓存并持久化到磁盘 */
     private suspend fun saveIndex(sessions: List<Session>) = withContext(Dispatchers.IO) {
         mutex.withLock {
             try {
@@ -58,6 +65,7 @@ class SessionManager(context: Context) {
                     array.put(sessionToJson(s))
                 }
                 indexFile.writeText(array.toString())
+                cachedSessions = sessions
             } catch (e: Exception) {
                 Log.e(TAG, "保存会话列表失败", e)
             }
@@ -65,36 +73,28 @@ class SessionManager(context: Context) {
     }
 
     /** 创建新会话并返回它 */
-    suspend fun createSession(title: String = "新对话"): Session = withContext(Dispatchers.IO) {
+    suspend fun createSession(title: String = "新对话"): Session {
         val session = Session(title = title)
         val current = loadSessions().toMutableList()
         current.add(0, session)
         saveIndex(current)
-        session
+        return session
     }
 
     /** 删除会话（索引 + 消息文件） */
-    suspend fun deleteSession(id: String) = withContext(Dispatchers.IO) {
-        mutex.withLock {
-            try {
-                val current = loadSessions().toMutableList()
-                current.removeAll { it.id == id }
-                val array = JSONArray()
-                current.forEach { s ->
-                    array.put(sessionToJson(s))
-                }
-                indexFile.writeText(array.toString())
-                // 删除消息文件
-                val msgFile = File(sessionsDir, "$id.json")
-                if (msgFile.exists()) msgFile.delete()
-            } catch (e: Exception) {
-                Log.e(TAG, "删除会话失败", e)
-            }
+    suspend fun deleteSession(id: String) {
+        val current = loadSessions().toMutableList()
+        current.removeAll { it.id == id }
+        saveIndex(current)
+        // 删除消息文件
+        withContext(Dispatchers.IO) {
+            val msgFile = File(sessionsDir, "$id.json")
+            if (msgFile.exists()) msgFile.delete()
         }
     }
 
     /** 更新会话标题 */
-    suspend fun updateTitle(id: String, title: String) = withContext(Dispatchers.IO) {
+    suspend fun updateTitle(id: String, title: String) {
         val current = loadSessions().toMutableList()
         val idx = current.indexOfFirst { it.id == id }
         if (idx >= 0) {
@@ -104,7 +104,7 @@ class SessionManager(context: Context) {
     }
 
     /** 更新会话的 updatedAt 时间戳 */
-    suspend fun touchSession(id: String) = withContext(Dispatchers.IO) {
+    suspend fun touchSession(id: String) {
         val current = loadSessions().toMutableList()
         val idx = current.indexOfFirst { it.id == id }
         if (idx >= 0) {
@@ -127,6 +127,7 @@ class SessionManager(context: Context) {
                 Message(
                     content = obj.getString(MSG_CONTENT),
                     isUser = obj.getBoolean(MSG_IS_USER),
+                    id = obj.optString(MSG_ID, java.util.UUID.randomUUID().toString()),
                 )
             }.filter { it.isUser || it.content.isNotBlank() }
         } catch (e: Exception) {
@@ -146,6 +147,7 @@ class SessionManager(context: Context) {
                         array.put(JSONObject().apply {
                             put(MSG_CONTENT, msg.content)
                             put(MSG_IS_USER, msg.isUser)
+                            put(MSG_ID, msg.id)
                         })
                     }
                     file.writeText(array.toString())
@@ -157,25 +159,21 @@ class SessionManager(context: Context) {
             }
         }
 
-    /** 内部方法：在已持有 mutex 时更新 updatedAt */
+    /** 内部方法：在已持有 mutex 时更新 updatedAt（直接操作内存缓存，避免重复读磁盘） */
     private fun touchSessionInternal(id: String) {
         try {
-            if (!indexFile.exists()) return
-            val json = indexFile.readText()
-            val array = JSONArray(json)
-            val list = mutableListOf<Session>()
-            for (i in 0 until array.length()) {
-                list.add(parseSessionFromJson(array.getJSONObject(i)))
-            }
-            val idx = list.indexOfFirst { it.id == id }
+            val current = cachedSessions?.toMutableList() ?: return
+            val idx = current.indexOfFirst { it.id == id }
             if (idx >= 0) {
-                list[idx] = list[idx].copy(updatedAt = System.currentTimeMillis())
+                current[idx] = current[idx].copy(updatedAt = System.currentTimeMillis())
+                cachedSessions = current
+                // 持久化
+                val array = JSONArray()
+                current.forEach { s ->
+                    array.put(sessionToJson(s))
+                }
+                indexFile.writeText(array.toString())
             }
-            val newArray = JSONArray()
-            list.forEach { s ->
-                newArray.put(sessionToJson(s))
-            }
-            indexFile.writeText(newArray.toString())
         } catch (e: Exception) {
             Log.e(TAG, "更新会话时间戳失败", e)
         }
@@ -223,5 +221,6 @@ class SessionManager(context: Context) {
         private const val KEY_CURRENT_SESSION = "current_session_id"
         private const val MSG_CONTENT = "content"
         private const val MSG_IS_USER = "isUser"
+        private const val MSG_ID = "id"
     }
 }

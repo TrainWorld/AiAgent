@@ -57,10 +57,20 @@ class ModelManager(context: Context) {
 
     /**
      * 将外部 Uri 对应的文件复制到 models 目录，返回目标文件。
-     * 如果同名文件已存在则先删除再覆盖。
+     * 如果同名同大小文件已存在则跳过拷贝，直接返回现有文件。
      */
     fun importModel(context: Context, uri: android.net.Uri, displayName: String): File {
         val target = File(modelsDir, "$displayName.gguf")
+
+        // 检查源文件大小，避免重复拷贝大文件
+        val sourceSize = context.contentResolver
+            .openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1L
+
+        if (target.exists() && sourceSize > 0 && target.length() == sourceSize) {
+            // 同名同大小文件已存在，跳过拷贝
+            return target
+        }
+
         if (target.exists()) target.delete()
         context.contentResolver.openInputStream(uri)?.use { input ->
             target.outputStream().use { output ->

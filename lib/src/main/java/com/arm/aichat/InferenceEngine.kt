@@ -52,6 +52,15 @@ interface InferenceEngine {
     fun stopGeneration()
 
     /**
+     * Update inference parameters. Takes effect on next model reload or immediately for temperature.
+     *
+     * @param temperature Sampling temperature (0.0 - 2.0)
+     * @param contextSize Context window size in tokens
+     * @param nThreads Number of inference threads (0 = auto)
+     */
+    fun setParams(temperature: Float, contextSize: Int, nThreads: Int)
+
+    /**
      * States of the inference engine
      */
     sealed class State {

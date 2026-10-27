@@ -9,6 +9,7 @@
 
 #pragma once
 #include <android/log.h>
+#include "ggml.h"
 
 #ifndef LOG_TAG
 #define LOG_TAG "ai-chat"

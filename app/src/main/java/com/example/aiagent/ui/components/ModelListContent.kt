@@ -4,7 +4,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -42,7 +41,6 @@ fun ModelListContent(
         modifier = Modifier
             .fillMaxWidth()
             .padding(bottom = 32.dp)
-            .navigationBarsPadding()
     ) {
         Text(
             "模型管理",
