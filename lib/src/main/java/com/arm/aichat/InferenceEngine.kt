@@ -61,6 +61,21 @@ interface InferenceEngine {
     fun setParams(temperature: Float, contextSize: Int, nThreads: Int)
 
     /**
+     * Switch the active KV Cache sequence ID (instant, no model reload).
+     */
+    fun switchSeqId(seqId: Int)
+
+    /**
+     * Release KV Cache slots for the given sequence ID.
+     */
+    fun removeSeqId(seqId: Int)
+
+    /**
+     * Reset KV Cache and state for the given sequence ID.
+     */
+    fun resetSeqId(seqId: Int)
+
+    /**
      * States of the inference engine
      */
     sealed class State {

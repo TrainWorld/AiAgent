@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <sampling.h>
 
+#include <unordered_map>
+#include <vector>
 #include "logging.h"
 #include "chat.h"
 #include "common.h"
@@ -32,6 +34,10 @@ constexpr int   DEFAULT_CONTEXT_SIZE    = 8192;
 constexpr int   OVERFLOW_HEADROOM       = 4;
 constexpr int   BATCH_SIZE              = 512;
 constexpr float DEFAULT_SAMPLER_TEMP    = 0.3f;
+
+// 同时隔离的最大会话数（KV Cache seq_id 上限，必须 <= LLAMA_MAX_SEQ=256）
+// Kotlin 层的 MAX_SEQ 必须与此保持一致，seq_id 需落在 [0, N_MAX_SEQ)
+constexpr int   N_MAX_SEQ               = 8;
 
 // 可配置推理参数（通过 JNI 设置）
 static int   g_config_context_size = DEFAULT_CONTEXT_SIZE;
@@ -109,6 +115,10 @@ static llama_context *init_context(llama_model *model, const int n_ctx = 0) {
     ctx_params.n_ubatch = BATCH_SIZE;
     ctx_params.n_threads = n_threads;
     ctx_params.n_threads_batch = n_threads;
+    // 多会话 KV 隔离：允许 seq_id 落在 [0, N_MAX_SEQ)；
+    // kv_unified=true 使各序列共享统一缓存池，避免非 unified 时 n_ctx 被 seq 数均分而大幅缩小每会话上下文。
+    ctx_params.n_seq_max = N_MAX_SEQ;
+    ctx_params.kv_unified = true;
     auto *context = llama_init_from_model(g_model, ctx_params);
     if (context == nullptr) {
         LOGe("%s: llama_new_context_with_model() returned null)", __func__);
@@ -286,17 +296,30 @@ constexpr const char *ROLE_SYSTEM       = "system";
 constexpr const char *ROLE_USER         = "user";
 constexpr const char *ROLE_ASSISTANT    = "assistant";
 
-static std::vector<common_chat_msg> chat_msgs;
-static llama_pos system_prompt_position;
-static llama_pos current_position;
+// ──────────────────── Per-Sequence State ────────────────────
+
+struct SeqState {
+    llama_pos current_position = 0;
+    llama_pos system_prompt_position = 0;
+    std::vector<common_chat_msg> chat_msgs;
+};
+
+static llama_seq_id g_active_seq_id = 0;
+static std::unordered_map<llama_seq_id, SeqState> g_seq_states;
+
+static SeqState& get_seq_state() {
+    return g_seq_states[g_active_seq_id];
+}
 
 static void reset_long_term_states(const bool clear_kv_cache = true) {
-    chat_msgs.clear();
-    system_prompt_position = 0;
-    current_position = 0;
+    auto& seq = get_seq_state();
+    seq.chat_msgs.clear();
+    seq.system_prompt_position = 0;
+    seq.current_position = 0;
 
-    if (clear_kv_cache)
-        llama_memory_clear(llama_get_memory(g_context), false);
+    if (clear_kv_cache && g_context) {
+        llama_memory_seq_rm(llama_get_memory(g_context), g_active_seq_id, 0, -1);
+    }
 }
 
 /**
@@ -308,12 +331,13 @@ static void reset_long_term_states(const bool clear_kv_cache = true) {
  * - recompute the logits in batches
  */
 static void shift_context() {
-    const int n_discard = (current_position - system_prompt_position) / 2;
-    LOGi("%s: Discarding %d tokens", __func__, n_discard);
-    llama_memory_seq_rm(llama_get_memory(g_context), 0, system_prompt_position, system_prompt_position + n_discard);
-    llama_memory_seq_add(llama_get_memory(g_context), 0, system_prompt_position + n_discard, current_position, -n_discard);
-    current_position -= n_discard;
-    LOGi("%s: Context shifting done! Current position: %d", __func__, current_position);
+    auto& seq = get_seq_state();
+    const int n_discard = (seq.current_position - seq.system_prompt_position) / 2;
+    LOGi("%s: Discarding %d tokens (seq_id %d)", __func__, n_discard, g_active_seq_id);
+    llama_memory_seq_rm(llama_get_memory(g_context), g_active_seq_id, seq.system_prompt_position, seq.system_prompt_position + n_discard);
+    llama_memory_seq_add(llama_get_memory(g_context), g_active_seq_id, seq.system_prompt_position + n_discard, seq.current_position, -n_discard);
+    seq.current_position -= n_discard;
+    LOGi("%s: Context shifting done! Current position: %d", __func__, seq.current_position);
 }
 
 static std::string chat_add_and_format(const std::string &role, const std::string &content) {
@@ -321,14 +345,15 @@ static std::string chat_add_and_format(const std::string &role, const std::strin
     new_msg.role = role;
     new_msg.content = content;
     std::string formatted;
+    auto& seq = get_seq_state();
     try {
         formatted = common_chat_format_single(
-                g_chat_templates.get(), chat_msgs, new_msg, role == ROLE_USER, /* use_jinja */ true);
+                g_chat_templates.get(), seq.chat_msgs, new_msg, role == ROLE_USER, /* use_jinja */ true);
     } catch (const std::exception & e) {
         LOGe("%s: Chat template formatting failed: %s", __func__, e.what());
         formatted = content; // fallback to raw content
     }
-    chat_msgs.push_back(new_msg);
+    seq.chat_msgs.push_back(new_msg);
     LOGi("%s: Formatted and added %s message: \n%s\n", __func__, role.c_str(), formatted.c_str());
     return formatted;
 }
@@ -373,7 +398,7 @@ static int decode_tokens_in_batches(
             const llama_token token_id = tokens[i + j];
             const llama_pos position = start_pos + i + j;
             const bool want_logit = compute_last_logit && (i + j == tokens.size() - 1);
-            batch.add(token_id, position, 0, want_logit);
+            batch.add(token_id, position, g_active_seq_id, want_logit);
         }
 
         // Decode this batch
@@ -425,13 +450,14 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
     }
 
     // Decode system tokens in batches
-    if (decode_tokens_in_batches(g_context, g_batch, system_tokens, current_position)) {
+    auto& seq = get_seq_state();
+    if (decode_tokens_in_batches(g_context, g_batch, system_tokens, seq.current_position)) {
         LOGe("%s: llama_decode() failed!", __func__);
         return 2;
     }
 
     // Update position
-    system_prompt_position = current_position = (int) system_tokens.size();
+    seq.system_prompt_position = seq.current_position = (int) system_tokens.size();
     return 0;
 }
 
@@ -474,14 +500,15 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
     }
 
     // Decode user tokens in batches
-    if (decode_tokens_in_batches(g_context, g_batch, user_tokens, current_position, true)) {
+    auto& seq = get_seq_state();
+    if (decode_tokens_in_batches(g_context, g_batch, user_tokens, seq.current_position, true)) {
         LOGe("%s: llama_decode() failed!", __func__);
         return 2;
     }
 
     // Update position
-    current_position += user_prompt_size;
-    stop_generation_position = current_position + user_prompt_size + n_predict;
+    seq.current_position += user_prompt_size;
+    stop_generation_position = seq.current_position + user_prompt_size + n_predict;
     return 0;
 }
 
@@ -526,13 +553,14 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
         jobject /*unused*/
 ) {
     // Infinite text generation via context shifting
-    if (current_position >= g_config_context_size - OVERFLOW_HEADROOM) {
+    auto& seq = get_seq_state();
+    if (seq.current_position >= g_config_context_size - OVERFLOW_HEADROOM) {
         LOGw("%s: Context full! Shifting...", __func__);
         shift_context();
     }
 
     // Stop if reaching the marked position
-    if (current_position >= stop_generation_position) {
+    if (seq.current_position >= stop_generation_position) {
         LOGw("%s: STOP: hitting stop position: %d", __func__, stop_generation_position);
         return nullptr;
     }
@@ -543,14 +571,14 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
 
     // Populate the batch with new token, then decode
     g_batch.clear();
-    g_batch.add(new_token_id, current_position, 0, true);
+    g_batch.add(new_token_id, seq.current_position, g_active_seq_id, true);
     if (llama_process(g_context, LLAMA_PROCESS_TYPE_DECODE, g_batch.get()) != 0) {
         LOGe("%s: llama_decode() failed for generated token", __func__);
         return nullptr;
     }
 
     // Update position
-    current_position++;
+    seq.current_position++;
 
     // Stop if next token is EOG
     if (llama_vocab_is_eog(llama_model_get_vocab(g_model), new_token_id)) {
@@ -582,8 +610,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv * /*unused*/, jobject /*unused*/) {
-    // Reset long-term & short-term states
-    reset_long_term_states();
+    // Clear all per-seq states
+    g_seq_states.clear();
+    g_active_seq_id = 0;
+
+    // Reset short-term states
     reset_short_term_states();
 
     // Free up resources
@@ -592,6 +623,47 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv * /*unused*/, job
     g_batch = common_batch();
     llama_free(g_context);
     llama_model_free(g_model);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_nativeSwitchSeqId(
+        JNIEnv *, jobject, jint newSeqId) {
+    // 防御性钳制：越界 seq_id 会让 batch.add 触发 GGML_ABORT，绝不允许传入
+    if (newSeqId < 0 || newSeqId >= N_MAX_SEQ) {
+        LOGe("%s: invalid seq_id %d (valid range [0, %d)); falling back to 0", __func__, newSeqId, N_MAX_SEQ);
+        newSeqId = 0;
+    }
+    g_active_seq_id = newSeqId;
+    // Ensure SeqState entry exists for this seq
+    get_seq_state();
+    reset_short_term_states();
+    LOGi("%s: Switched to seq_id %d", __func__, newSeqId);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_nativeRemoveSeqId(
+        JNIEnv *, jobject, jint seqId) {
+    if (g_context) {
+        llama_memory_seq_rm(llama_get_memory(g_context), seqId, 0, -1);
+    }
+    g_seq_states.erase(seqId);
+    LOGi("%s: Removed seq_id %d", __func__, seqId);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_nativeResetSeqId(
+        JNIEnv *, jobject, jint seqId) {
+    if (g_context) {
+        llama_memory_seq_rm(llama_get_memory(g_context), seqId, 0, -1);
+    }
+    auto& seq = g_seq_states[seqId];
+    seq.chat_msgs.clear();
+    seq.system_prompt_position = 0;
+    seq.current_position = 0;
+    LOGi("%s: Reset seq_id %d", __func__, seqId);
 }
 
 extern "C"

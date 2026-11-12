@@ -112,6 +112,15 @@ internal class InferenceEngineImpl private constructor(
     @FastNative
     private external fun setInferenceParams(temperature: Float, contextSize: Int, nThreads: Int)
 
+    @FastNative
+    private external fun nativeSwitchSeqId(seqId: Int)
+
+    @FastNative
+    private external fun nativeRemoveSeqId(seqId: Int)
+
+    @FastNative
+    private external fun nativeResetSeqId(seqId: Int)
+
     private val _state =
         MutableStateFlow<InferenceEngine.State>(InferenceEngine.State.Uninitialized)
     override val state: StateFlow<InferenceEngine.State> = _state.asStateFlow()
@@ -347,5 +356,26 @@ internal class InferenceEngineImpl private constructor(
 
     override fun setParams(temperature: Float, contextSize: Int, nThreads: Int) {
         setInferenceParams(temperature, contextSize, nThreads)
+    }
+
+    override fun switchSeqId(seqId: Int) {
+        Log.d(TAG, "switchSeqId: $seqId")
+        llamaScope.launch(llamaDispatcher) {
+            nativeSwitchSeqId(seqId)
+        }
+    }
+
+    override fun removeSeqId(seqId: Int) {
+        Log.d(TAG, "removeSeqId: $seqId")
+        llamaScope.launch(llamaDispatcher) {
+            nativeRemoveSeqId(seqId)
+        }
+    }
+
+    override fun resetSeqId(seqId: Int) {
+        Log.d(TAG, "resetSeqId: $seqId")
+        llamaScope.launch(llamaDispatcher) {
+            nativeResetSeqId(seqId)
+        }
     }
 }

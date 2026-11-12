@@ -16,12 +16,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import androidx.core.content.edit
 
 /**
  * 聊天界面的 ViewModel，持有所有业务状态与逻辑。
@@ -39,6 +39,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private const val KEY_TEMPERATURE = "temperature"
         private const val KEY_CONTEXT_SIZE = "context_size"
         private const val KEY_N_THREADS = "n_threads"
+        // KV Cache seq_id 上限，必须与 C++ 层 ai_chat.cpp 的 N_MAX_SEQ 保持一致
+        private const val MAX_SEQ = 8
     }
 
     /** 推理参数配置 */
@@ -54,6 +56,43 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val modelManager = ModelManager(application)
     private val sessionManager = SessionManager(application)
     private val messagesMutex = Mutex() // 保护消息列表的并发访问
+
+    // ──────────────────── KV Cache seq_id 映射 ────────────────────
+
+    // sessionId -> seq_id，LinkedHashMap 保证插入顺序，便于 LRU 回收
+    private val sessionSeqMap = object : LinkedHashMap<String, Int>() {
+        override fun get(key: String): Int? {
+            // 访问顺序刷到链表尾部，实现近 LRU
+            val v = super.get(key)
+            if (v != null) { remove(key); put(key, v) }
+            return v
+        }
+    }
+
+    /**
+     * 获取会话对应的 seq_id，分配范围严格限定在 [0, MAX_SEQ)。
+     * 当活跃会话数超过 MAX_SEQ 时，回收最久未使用且非当前会话的槽位。
+     */
+    private fun getOrCreateSeqId(sessionId: String): Int {
+        sessionSeqMap[sessionId]?.let { return it }
+
+        val id = if (sessionSeqMap.size < MAX_SEQ) {
+            // 取第一个未使用的 id
+            (0 until MAX_SEQ).first { it !in sessionSeqMap.values }
+        } else {
+            // 需回收：选一个非当前会话、最久未使用的槽位（ LinkedHashMap 头部）
+            val victim = sessionSeqMap.entries.firstOrNull { it.key != _currentSessionId.value }
+            if (victim != null) {
+                engine.removeSeqId(victim.value) // 释放其 KV Cache
+                sessionSeqMap.remove(victim.key)
+                victim.value
+            } else {
+                0 // 极端情况：全是当前会话，回退复用 0
+            }
+        }
+        sessionSeqMap[sessionId] = id
+        return id
+    }
 
     // ──────────────────── 推理参数 ────────────────────
 
@@ -158,6 +197,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 Log.i(TAG, "已恢复会话 $targetSession 的 ${history.size} 条消息")
             }
 
+            // 设置当前会话的 seq_id
+            getOrCreateSeqId(targetSession)
+
             // 自动加载上次使用的模型
             autoLoadSavedModel()
 
@@ -186,11 +228,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun saveInferenceParams(params: InferenceParams) {
-        prefs.edit()
-            .putFloat(KEY_TEMPERATURE, params.temperature)
-            .putInt(KEY_CONTEXT_SIZE, params.contextSize)
-            .putInt(KEY_N_THREADS, params.nThreads)
-            .apply()
+        prefs.edit {
+            putFloat(KEY_TEMPERATURE, params.temperature)
+                .putInt(KEY_CONTEXT_SIZE, params.contextSize)
+                .putInt(KEY_N_THREADS, params.nThreads)
+        }
     }
 
     private fun applyInferenceParams() {
@@ -263,7 +305,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** 内部方法：保存当前 → 切换 → 加载 → 重建上下文 */
+    /** 内部方法：保存当前 → 切换 → 加载 → 切换 seq_id */
     private suspend fun switchSessionInternal(id: String) {
         // 1. 停止当前生成
         engine.stopGeneration()
@@ -285,8 +327,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         Log.i(TAG, "已切换到会话 $id")
 
-        // 4. 重建 native 上下文（cleanUp + reload 当前模型）
-        rebuildNativeContext()
+        // 4. 切换 seq_id（瞬时，无需卸载模型）
+        val seqId = getOrCreateSeqId(id)
+        engine.switchSeqId(seqId)
 
         // 5. 重置多模态引擎对话历史（会话隔离）
         multimodalEngine.resetConversation()
@@ -295,6 +338,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     /** 删除会话；若删除的是当前会话，自动切到另一个 */
     fun deleteSession(id: String) {
         viewModelScope.launch(Dispatchers.Default) {
+            // 释放该会话的 KV Cache
+            sessionSeqMap.remove(id)?.let { seqId ->
+                engine.removeSeqId(seqId)
+            }
+
             sessionManager.deleteSession(id)
             val remaining = sessionManager.loadSessions()
             _sessions.value = remaining
@@ -308,24 +356,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     switchSessionInternal(newSession.id)
                 }
             }
-        }
-    }
-
-    /** 重建 native 上下文：卸载当前模型再重新加载，清空 KV cache */
-    private suspend fun rebuildNativeContext() {
-        val state = engineState.value
-        val isModelLoaded = state is InferenceEngine.State.ModelReady ||
-                state is InferenceEngine.State.Error
-        if (!isModelLoaded) return
-
-        val modelName = modelManager.getCurrentModelName() ?: return
-        val model = modelManager.listModels().find { it.displayName == modelName } ?: return
-        try {
-            engine.cleanUp()
-            loadModelFile(model.file)
-            Log.i(TAG, "Native 上下文已重建")
-        } catch (e: Exception) {
-            Log.e(TAG, "重建上下文失败", e)
         }
     }
 
@@ -418,6 +448,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         multimodalEngine.stopGeneration()
         _streamingAiContent.value = ""
         _streamingAiIndex.value = -1
+
+        // 重置该会话的 KV Cache
+        sessionSeqMap[sessionId]?.let { seqId ->
+            engine.resetSeqId(seqId)
+        }
+
         viewModelScope.launch(Dispatchers.Default) {
             messagesMutex.withLock {
                 _messages.value = emptyList()
@@ -454,7 +490,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             Log.i(TAG, "附件已缓存: $path (来源: $uri)")
             val att = Attachment(uri.toString(), Attachment.Type.IMAGE, path)
-            _pendingAttachments.value = _pendingAttachments.value + att
+            _pendingAttachments.value += att
         }
     }
 
